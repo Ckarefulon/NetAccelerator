@@ -1,0 +1,20 @@
+# Exact Watt Toolkit project data captured from LOCAL_ACCELERATE.json on 2026-08-11.
+# listen domains<TAB>forward destination<TAB>mode<TAB>ignore TLS name mismatch<TAB>optional path token
+google.com;www.google.com	www.recaptcha.net	direct	true	/recaptcha
+hcaptcha.com;assets.hcaptcha.com;imgs.hcaptcha.com;www.hcaptcha.com;docs.hcaptcha.com;js.hcaptcha.com;newassets.hcaptcha.com;imgs3.hcaptcha.com	cf.rmbgame.net	direct	true
+client-api.arkoselabs.com;epic-games-api.arkoselabs.com;cdn.arkoselabs.com;prod-ireland.arkoselabs.com	roblox-api.arkoselabs.com.cdn.cloudflare.net	direct	true
+huggingface.co	http://pt.mossimo.net:41080/	server-accelerate	false
+github.dev	20.43.185.14	direct	true
+api.github.com	githubapi.rmbgame.net	direct	true
+github.githubassets.com;support-assets.githubassets.com	githubdocs.rmbgame.net	direct	true
+education.github.com	educationgithub.rmbgame.net	direct	true
+resources.github.com	resources.github.com	direct	true
+uploads.github.com	uploads.github.com	direct	true
+archiveprogram.github.com	archiveprogram.github.com	direct	true
+raw.github.com;githubusercontent.com;raw.githubusercontent.com;camo.githubusercontent.com;cloud.githubusercontent.com;avatars.githubusercontent.com;avatars0.githubusercontent.com;avatars1.githubusercontent.com;avatars2.githubusercontent.com;avatars3.githubusercontent.com;user-images.githubusercontent.com;objects.githubusercontent.com;private-user-images.githubusercontent.com	23.235.37.133	direct	true
+pipelines.actions.githubusercontent.com	githubpipelines.rmbgame.net	direct	true
+github.com;pages.github.com;gist.github.com	20.207.73.82	direct	true
+githubapp.com	140.82.112.29	direct	true
+hub.docker.com	54.208.73.48	direct	true
+greasyfork.org;update.greasyfork.org	http://pt.mossimo.net:41080/	server-accelerate	false
+github.io;www.github.io	185.199.110.153	direct	true
