@@ -251,6 +251,9 @@ namespace NetAccelerator
         private static async Task<Stream> ConnectManagedCoreAsync(SocketsHttpConnectionContext context, CancellationToken cancellationToken, ManagedTarget target)
         {
             var addresses = new List<IPAddress>();
+            // Prefer addresses discovered for the real host. Literal addresses in the
+            // captured Watt rules are snapshots and must not outrank live DNS.
+            addresses.AddRange(ResolveTrusted(target.OriginalHost));
             ProxyRule rule = target.Rule;
             if (rule != null && rule.Mode != "server-accelerate")
             {
@@ -258,11 +261,10 @@ namespace NetAccelerator
                 string forward = rule.Forward;
                 if (Uri.TryCreate(forward, UriKind.Absolute, out absolute)) forward = absolute.Host;
                 IPAddress literal;
-                if (IPAddress.TryParse(forward, out literal)) addresses.Add(literal);
-                else if (!String.Equals(forward, target.OriginalHost, StringComparison.OrdinalIgnoreCase))
+                if (!IPAddress.TryParse(forward, out literal) &&
+                    !String.Equals(forward, target.OriginalHost, StringComparison.OrdinalIgnoreCase))
                     addresses.AddRange(ResolveTrusted(forward));
             }
-            addresses.AddRange(ResolveTrusted(target.OriginalHost));
             addresses = OrderCandidateAddresses(target.OriginalHost, addresses).ToList();
             var failures = new List<Exception>();
             foreach (IPAddress address in addresses)
@@ -685,10 +687,14 @@ namespace NetAccelerator
         {
             selected = null;
             IPAddress literal;
-            IPAddress[] addresses = IPAddress.TryParse(host, out literal)
+            bool isLiteral = IPAddress.TryParse(host, out literal);
+            IPAddress[] addresses = isLiteral
                 ? new[] { literal }
                 : ResolveTrusted(host);
-            addresses = OrderCandidateAddresses(host, addresses).ToArray();
+            // Local HTTP proxies are expected to use loopback. Target resolution still
+            // goes through OrderCandidateAddresses, which rejects loopback poisoning.
+            if (!(isLiteral && IPAddress.IsLoopback(literal)))
+                addresses = OrderCandidateAddresses(host, addresses).ToArray();
             for (int attempt = 0; attempt < 1; attempt++)
             {
                 foreach (IPAddress address in addresses)
@@ -875,6 +881,17 @@ namespace NetAccelerator
         }
 
         private static bool SelfTest(out string error)
+        {
+            error = null;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                if (SelfTestOnce(out error)) return true;
+                if (attempt == 0) Thread.Sleep(500);
+            }
+            return false;
+        }
+
+        private static bool SelfTestOnce(out string error)
         {
             error = null;
             try
