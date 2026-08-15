@@ -37,6 +37,7 @@ namespace NetAccelerator
         private static readonly string HostsBackupPath = Path.Combine(RuntimeDir, "hosts-backup.txt");
         private static readonly string LogPath = Path.Combine(RuntimeDir, "proxy.log");
         private static readonly string[] DnsServers = { "223.5.5.5", "119.29.29.29", "114.114.114.114", "1.1.1.1" };
+        private static readonly string[] GitHubEcsSubnets = { "8.8.8.0", "9.9.9.0", "168.95.1.0", "80.80.80.0", "185.228.168.0" };
         private static readonly object LogLock = new object();
         private static readonly object DnsLock = new object();
         private static readonly object BackoffLock = new object();
@@ -48,6 +49,7 @@ namespace NetAccelerator
         private static readonly Dictionary<string, IPAddress> PreferredAddresses = new Dictionary<string, IPAddress>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, ManagedClientEntry> HttpClients = new Dictionary<string, ManagedClientEntry>(StringComparer.OrdinalIgnoreCase);
         private static volatile bool stopping;
+        private static bool allowTransportProxy = true;
         private static TcpListener httpListener;
         private static TcpListener httpsListener;
         private static HashSet<string> domains;
@@ -72,6 +74,8 @@ namespace NetAccelerator
         public static int Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
+            bool manageHosts = !args.Any(arg => String.Equals(arg, "--no-hosts", StringComparison.OrdinalIgnoreCase));
+            allowTransportProxy = !args.Any(arg => String.Equals(arg, "--no-proxy", StringComparison.OrdinalIgnoreCase));
             try
             {
                 Directory.CreateDirectory(RuntimeDir);
@@ -100,7 +104,7 @@ namespace NetAccelerator
                     return 3;
                 }
 
-                ApplyHosts();
+                if (manageHosts) ApplyHosts();
                 WriteStatus("ready", "Watt Hosts 模式已就绪：GitHub、国外验证码平台");
                 Log("READY domains=" + domains.Count);
 
@@ -122,7 +126,7 @@ namespace NetAccelerator
             {
                 stopping = true;
                 StopListeners();
-                try { RestoreHosts(); } catch (Exception ex) { Log("HOSTS-RESTORE " + ex.Message); }
+                if (manageHosts) try { RestoreHosts(); } catch (Exception ex) { Log("HOSTS-RESTORE " + ex.Message); }
                 try { File.Delete(StopPath); } catch { }
                 if (File.Exists(StatusPath) && ReadStatusState() == "ready")
                     WriteStatus("stopped", "服务已停止，目标域名 Hosts 已恢复；系统代理从未改动");
@@ -148,14 +152,15 @@ namespace NetAccelerator
             catch (Exception first)
             {
                 Log("HTTP-POOL-FAIL host=" + host + " target=" + primary.Destination + " " + UnwrapMessage(first));
+                InvalidateHttpClient(primary);
                 if (!replayable)
                 {
                     WriteResponse(downstream, "502 Bad Gateway", "Upstream request failed for " + host + ".");
                     return;
                 }
+                ManagedTarget fallback = SelectManagedTarget(host, requestTarget, rule, true);
                 try
                 {
-                    ManagedTarget fallback = SelectManagedTarget(host, requestTarget, rule, true);
                     SendManagedRequest(downstream, rawHeader, method, host, fallback, rule, 0, false);
                     Log("HTTP-POOL " + host + " -> " + fallback.Destination +
                         (fallback.Proxy == null ? " direct fallback" : " via existing system proxy fallback"));
@@ -163,6 +168,7 @@ namespace NetAccelerator
                 catch (Exception second)
                 {
                     Log("HTTP-POOL-FALLBACK-FAIL host=" + host + " " + UnwrapMessage(second));
+                    InvalidateHttpClient(fallback);
                     WriteResponse(downstream, "502 Bad Gateway", "Upstream request failed for " + host + ".");
                 }
             }
@@ -203,9 +209,7 @@ namespace NetAccelerator
 
         private static HttpClient GetHttpClient(ManagedTarget target)
         {
-            string key = target.Destination.Scheme + "://" + target.Destination.Authority + "|" +
-                (target.Proxy == null ? "direct" : target.Proxy.AbsoluteUri) + "|" + target.IgnoreNameMismatch + "|" +
-                (target.Rule == null ? "none" : target.Rule.Mode + ":" + target.Rule.Forward);
+            string key = GetHttpClientKey(target);
             lock (HttpClientLock)
             {
                 ManagedClientEntry existing;
@@ -235,6 +239,11 @@ namespace NetAccelerator
                     handler.ConnectCallback = delegate(SocketsHttpConnectionContext context, CancellationToken token)
                     { return new ValueTask<Stream>(ConnectManagedCoreAsync(context, token, captured)); };
                 }
+                else
+                {
+                    handler.ConnectCallback = delegate(SocketsHttpConnectionContext context, CancellationToken token)
+                    { return new ValueTask<Stream>(ConnectProxyCoreAsync(context, token)); };
+                }
                 var client = new HttpClient(handler, true);
                 client.Timeout = Timeout.InfiniteTimeSpan;
                 if (existing != null)
@@ -246,6 +255,31 @@ namespace NetAccelerator
                     ExpiresUtc = DateTime.UtcNow.AddSeconds(existing == null ? 10 : 100) };
                 return client;
             }
+        }
+
+        private static string GetHttpClientKey(ManagedTarget target)
+        {
+            return target.Destination.Scheme + "://" + target.Destination.Authority + "|" +
+                (target.Proxy == null ? "direct" : target.Proxy.AbsoluteUri) + "|" + target.IgnoreNameMismatch + "|" +
+                (target.Rule == null ? "none" : target.Rule.Mode + ":" + target.Rule.Forward);
+        }
+
+        private static void InvalidateHttpClient(ManagedTarget target)
+        {
+            lock (HttpClientLock)
+            {
+                ManagedClientEntry entry;
+                if (!HttpClients.TryGetValue(GetHttpClientKey(target), out entry)) return;
+                HttpClients.Remove(GetHttpClientKey(target));
+                Task.Delay(TimeSpan.FromSeconds(5)).ContinueWith(delegate { entry.Client.Dispose(); });
+            }
+            lock (AddressStateLock)
+            {
+                IPAddress failed;
+                if (PreferredAddresses.TryGetValue(target.OriginalHost, out failed))
+                    AddressBackoff[failed.ToString()] = DateTime.UtcNow.AddMinutes(2);
+            }
+            lock (DnsLock) DnsCache.Remove(target.OriginalHost);
         }
 
         private static async Task<Stream> ConnectManagedCoreAsync(SocketsHttpConnectionContext context, CancellationToken cancellationToken, ManagedTarget target)
@@ -293,6 +327,45 @@ namespace NetAccelerator
                 }
             }
             throw new AggregateException("Could not connect using configured IP, forward DNS, or original DNS.", failures);
+        }
+
+        private static async Task<Stream> ConnectProxyCoreAsync(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+        {
+            var failures = new List<Exception>();
+            DateTime deadline = DateTime.UtcNow.AddSeconds(8);
+            IPAddress literal;
+            IPAddress[] addresses = IPAddress.TryParse(context.DnsEndPoint.Host, out literal)
+                ? new[] { literal }
+                : Dns.GetHostAddresses(context.DnsEndPoint.Host);
+            do
+            {
+                foreach (IPAddress address in addresses)
+                {
+                    Socket socket = null;
+                    try
+                    {
+                        socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                        socket.NoDelay = true;
+                        using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                        {
+                            timeout.CancelAfter(TimeSpan.FromMilliseconds(800));
+                            await socket.ConnectAsync(new IPEndPoint(address, context.DnsEndPoint.Port), timeout.Token).AsTask();
+                            var network = new NetworkStream(socket, true);
+                            socket = null;
+                            Log("PROXY-CONNECT " + context.DnsEndPoint.Host + ":" + context.DnsEndPoint.Port);
+                            return network;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add(ex);
+                        if (socket != null) try { socket.Dispose(); } catch { }
+                    }
+                }
+                if (DateTime.UtcNow < deadline) await Task.Delay(250, cancellationToken);
+            }
+            while (DateTime.UtcNow < deadline);
+            throw new AggregateException("Local transport proxy did not become ready within 8 seconds.", failures);
         }
 
         private static void CopyRequestHeaders(byte[] rawHeader, HttpRequestMessage request)
@@ -468,6 +541,7 @@ namespace NetAccelerator
         private static void HandleClient(TcpClient client, bool tls)
         {
             Stream downstream = null;
+            SslStream downstreamTls = null;
             TcpClient upstreamClient = null;
             Stream upstream = null;
             try
@@ -477,9 +551,9 @@ namespace NetAccelerator
                 downstream = client.GetStream();
                 if (tls)
                 {
-                    var ssl = new SslStream(downstream, false);
-                    ssl.AuthenticateAsServer(serverCertificate, false, SslProtocols.Tls12, false);
-                    downstream = ssl;
+                    downstreamTls = new SslStream(downstream, false);
+                    downstreamTls.AuthenticateAsServer(serverCertificate, false, SslProtocols.Tls12, false);
+                    downstream = downstreamTls;
                 }
 
                 byte[] header = ReadHeader(downstream, 65536);
@@ -506,6 +580,7 @@ namespace NetAccelerator
             {
                 try { if (upstream != null) upstream.Dispose(); } catch { }
                 try { if (upstreamClient != null) upstreamClient.Close(); } catch { }
+                try { if (downstreamTls != null) downstreamTls.ShutdownAsync().GetAwaiter().GetResult(); } catch { }
                 try { if (downstream != null) downstream.Dispose(); } catch { }
                 try { client.Close(); } catch { }
             }
@@ -634,6 +709,7 @@ namespace NetAccelerator
 
         private static Uri ReadSystemProxy()
         {
+            if (!allowTransportProxy) return null;
             try
             {
                 if (File.Exists(TransportProxyPath))
@@ -642,7 +718,8 @@ namespace NetAccelerator
                     Uri explicitProxy;
                     if (Uri.TryCreate(configured, UriKind.Absolute, out explicitProxy) &&
                         !(IPAddress.IsLoopback(Dns.GetHostAddresses(explicitProxy.Host).FirstOrDefault() ?? IPAddress.None) &&
-                          (explicitProxy.Port == HttpPort || explicitProxy.Port == HttpsPort))) return explicitProxy;
+                          (explicitProxy.Port == HttpPort || explicitProxy.Port == HttpsPort)) &&
+                        IsProxyEndpointAvailable(explicitProxy)) return explicitProxy;
                 }
             }
             catch { }
@@ -667,7 +744,8 @@ namespace NetAccelerator
                             Uri proxy;
                             if (Uri.TryCreate(value, UriKind.Absolute, out proxy) &&
                                 !(IPAddress.IsLoopback(Dns.GetHostAddresses(proxy.Host).FirstOrDefault() ?? IPAddress.None) &&
-                                  (proxy.Port == HttpPort || proxy.Port == HttpsPort))) return proxy;
+                                  (proxy.Port == HttpPort || proxy.Port == HttpsPort)) &&
+                                IsProxyEndpointAvailable(proxy)) return proxy;
                         }
                     }
                 }
@@ -681,6 +759,17 @@ namespace NetAccelerator
             }
             catch { }
             return null;
+        }
+
+        private static bool IsProxyEndpointAvailable(Uri proxy)
+        {
+            IPAddress literal;
+            IPAddress[] addresses = IPAddress.TryParse(proxy.Host, out literal)
+                ? new[] { literal }
+                : Dns.GetHostAddresses(proxy.Host);
+            if (!addresses.Any(IPAddress.IsLoopback)) return true;
+            return IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners()
+                .Any(endpoint => endpoint.Port == proxy.Port && IPAddress.IsLoopback(endpoint.Address));
         }
 
         private static TcpClient ConnectFastest(string host, int port, out IPAddress selected)
@@ -730,14 +819,28 @@ namespace NetAccelerator
                     return cached.Addresses;
             }
 
-            Task<IPAddress[]>[] queries = DnsServers.Select(dns => Task.Run(delegate
+            var queryList = DnsServers.Select(dns => Task.Run(delegate
             {
                 try
                 {
                     return QueryDnsA(host, IPAddress.Parse(dns)).ToArray();
                 }
                 catch { return new IPAddress[0]; }
-            })).ToArray();
+            })).ToList();
+            if (String.Equals(host, "github.com", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(host, "api.github.com", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (string subnet in GitHubEcsSubnets)
+                {
+                    string captured = subnet;
+                    queryList.Add(Task.Run(delegate
+                    {
+                        try { return QueryDnsA(host, IPAddress.Parse("8.8.8.8"), IPAddress.Parse(captured), 24).ToArray(); }
+                        catch { return new IPAddress[0]; }
+                    }));
+                }
+            }
+            Task<IPAddress[]>[] queries = queryList.ToArray();
             try { Task.WaitAll(queries.Cast<Task>().ToArray(), 3000); } catch { }
 
             var result = new List<IPAddress>();
@@ -789,18 +892,31 @@ namespace NetAccelerator
             lock (AddressStateLock) AddressBackoff[address.ToString()] = DateTime.UtcNow.AddMinutes(2);
         }
 
-        private static IEnumerable<IPAddress> QueryDnsA(string host, IPAddress dnsServer)
+        private static IEnumerable<IPAddress> QueryDnsA(string host, IPAddress dnsServer, IPAddress ecsAddress = null, int ecsPrefix = 0)
         {
             ushort id = (ushort)new Random(unchecked(Environment.TickCount ^ Thread.CurrentThread.ManagedThreadId)).Next(1, 65535);
             var query = new MemoryStream();
             WriteUInt16(query, id); WriteUInt16(query, 0x0100); WriteUInt16(query, 1);
-            WriteUInt16(query, 0); WriteUInt16(query, 0); WriteUInt16(query, 0);
+            WriteUInt16(query, 0); WriteUInt16(query, 0); WriteUInt16(query, ecsAddress == null ? 0 : 1);
             foreach (string label in host.Split('.'))
             {
                 byte[] bytes = Encoding.ASCII.GetBytes(label);
                 query.WriteByte((byte)bytes.Length); query.Write(bytes, 0, bytes.Length);
             }
             query.WriteByte(0); WriteUInt16(query, 1); WriteUInt16(query, 1);
+            if (ecsAddress != null)
+            {
+                byte[] addressBytes = ecsAddress.GetAddressBytes();
+                int addressLength = (ecsPrefix + 7) / 8;
+                int optionLength = 4 + addressLength;
+                query.WriteByte(0); WriteUInt16(query, 41); WriteUInt16(query, 1232);
+                WriteUInt16(query, 0); WriteUInt16(query, 0);
+                WriteUInt16(query, 4 + optionLength);
+                WriteUInt16(query, 8); WriteUInt16(query, optionLength);
+                WriteUInt16(query, ecsAddress.AddressFamily == AddressFamily.InterNetwork ? 1 : 2);
+                query.WriteByte((byte)ecsPrefix); query.WriteByte(0);
+                query.Write(addressBytes, 0, addressLength);
+            }
 
             using (var udp = new UdpClient(dnsServer.AddressFamily))
             {

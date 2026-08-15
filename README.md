@@ -9,14 +9,14 @@ NetAccelerator 是只保留 **Github** 与 **国外验证码平台** 的轻量 W
 1. 本机反向代理监听 `127.0.0.1:80` 和 `127.0.0.1:443`。
 2. 仅在服务真实自检通过后，向 Hosts 写入带边界标记的目标域名映射。
 3. 浏览器访问目标域名时连接本机；上游使用与 Watt 相同的现代 `SocketsHttpHandler` 连接池和应用层 HTTP 反向代理，不再为每个请求创建裸 `TcpClient + SslStream` 隧道。
-4. `ConnectCallback` 按配置 IP、转发域名实时 DNS、原域名实时 DNS 顺序尝试，并保持原域名 SNI；四个独立 DNS 并行收集候选，成功地址优先复用，失败地址进入短期退避；启用 HTTP/2 多连接。
+4. `ConnectCallback` 使用普通实时 DNS，并为 GitHub/API 增加多个地区视角的标准 EDNS 查询；候选地址保持原域名 SNI，成功地址优先复用，HTTP 失败时废弃连接池并自动换地址。
 5. 每个域名首次 Handler 生命周期为 10 秒，后续为 100 秒，旧连接延迟回收，避免失效连接长期驻留。
-6. 普通 Watt 规则优先使用配置 IP、转发域名 DNS、原域名 DNS，失败后才接入现有 Clash；服务器加速规则反向排序。Clash 的 GitHub 规则仍为 DIRECT，程序不修改 Clash 规则或系统代理。
+6. 普通规则使用实时 DNS 和转发域名实时 DNS，Watt 缓存中的固定 IP 不再参与连接；现有 Clash 仅作为最后一级可选兜底，未运行时会被立即跳过。程序不修改 Clash 规则或系统代理。
 7. 退出时只删除 `# NetAccelerator Start` 至 `# NetAccelerator End`，不覆盖其它 Hosts 内容。
 
 目标域名来自当前 Watt Toolkit 中截图所示的两个启用组，完整清单位于 `Windows/config/domains.txt`，包括 Github Dev/API/Assets/Education/Resources/Uploads/UserContent、Git Push、Github App、Docker Hub、Github.io、Hugging Face、Greasy Fork，以及 Google reCAPTCHA、hCaptcha、Arkose Labs。
 
-Hugging Face 与 Greasy Fork 在 Watt 中标记为 Beta，并依赖 Watt 后端签发的短期 `X-Watt-Token`。NetAccelerator 不读取或伪造 Watt 的账号令牌；这两项在令牌不可用时通过现有系统代理兼容转发。其余 GitHub 与验证码项目把保存的优选 IP 仅作为首选候选，并在每次 DNS 缓存过期后自行从多 DNS 获取转发域名和原域名的最新地址；运行时无需启动 Watt。
+Hugging Face 与 Greasy Fork 在 Watt 中标记为 Beta，并依赖 Watt 后端签发的短期 `X-Watt-Token`。NetAccelerator 不读取或伪造 Watt 的账号令牌；这两项只能在可用传输路径下兼容转发。GitHub 与验证码项目不使用保存的固定 IP，每次 DNS 缓存过期后自动获取最新地址；运行时无需启动 Watt 或 Clash。
 
 ## 使用
 

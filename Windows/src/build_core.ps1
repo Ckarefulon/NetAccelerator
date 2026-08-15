@@ -21,12 +21,15 @@ $references = Get-ChildItem -LiteralPath $runtime.FullName -Filter '*.dll' |
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $target = Join-Path $binDir 'NetAcceleratorServer.dll'
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("NetAcceleratorServer-{0}.dll" -f [guid]::NewGuid().ToString('N'))
+$responseFile = Join-Path ([IO.Path]::GetTempPath()) ("NetAcceleratorServer-{0}.rsp" -f [guid]::NewGuid().ToString('N'))
 try {
-    & $compiler /nologo /noconfig /nostdlib+ /target:exe /optimize+ /codepage:65001 `
-        "/out:$temporary" $references `
-        "$PSScriptRoot\NetAcceleratorServer.cs"
+    $compilerArguments = @('/nologo', '/nostdlib+', '/target:exe', '/optimize+', '/codepage:65001',
+        ('/out:"' + $temporary + '"')) + $references + @('"' + (Join-Path $PSScriptRoot 'NetAcceleratorServer.cs') + '"')
+    [IO.File]::WriteAllLines($responseFile, $compilerArguments, [Text.UTF8Encoding]::new($false))
+    & $compiler /noconfig "@$responseFile"
     if ($LASTEXITCODE -ne 0) { throw "Compilation failed with exit code $LASTEXITCODE." }
     [IO.File]::Copy($temporary, $target, $true)
 } finally {
     Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $responseFile -Force -ErrorAction SilentlyContinue
 }
