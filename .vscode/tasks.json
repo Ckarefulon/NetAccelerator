@@ -14,7 +14,7 @@
     {
       "label": "清理安卓构建",
       "type": "shell",
-      "command": "gradle --project-dir android --no-daemon clean",
+      "command": "gradle --project-dir Android --no-daemon clean",
       "problemMatcher": ["$gradle"]
     }
   ]

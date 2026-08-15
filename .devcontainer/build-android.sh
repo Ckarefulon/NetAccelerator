@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-android_root="${repo_root}/android"
+android_root="${repo_root}/Android"
 artifact_dir="${repo_root}/artifacts"
 apk_source="${android_root}/app/build/outputs/apk/debug/app-debug.apk"
 apk_target="${artifact_dir}/NetAccelerator-android-debug.apk"

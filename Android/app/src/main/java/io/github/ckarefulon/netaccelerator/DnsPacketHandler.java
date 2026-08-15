@@ -1,40 +1,14 @@
 package io.github.ckarefulon.netaccelerator;
 
 import java.io.ByteArrayOutputStream;
-import java.net.InetAddress;
-import java.util.Collections;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 
 final class DnsPacketHandler {
-    private static final Map<String, byte[]> HOSTS;
-    static {
-        Map<String, byte[]> hosts = new HashMap<>();
-        put(hosts, "github.dev", "20.43.185.14");
-        put(hosts, "raw.github.com", "23.235.37.133");
-        put(hosts, "githubusercontent.com", "23.235.37.133");
-        put(hosts, "raw.githubusercontent.com", "23.235.37.133");
-        put(hosts, "camo.githubusercontent.com", "23.235.37.133");
-        put(hosts, "cloud.githubusercontent.com", "23.235.37.133");
-        put(hosts, "avatars.githubusercontent.com", "23.235.37.133");
-        put(hosts, "avatars0.githubusercontent.com", "23.235.37.133");
-        put(hosts, "avatars1.githubusercontent.com", "23.235.37.133");
-        put(hosts, "avatars2.githubusercontent.com", "23.235.37.133");
-        put(hosts, "avatars3.githubusercontent.com", "23.235.37.133");
-        put(hosts, "user-images.githubusercontent.com", "23.235.37.133");
-        put(hosts, "objects.githubusercontent.com", "23.235.37.133");
-        put(hosts, "private-user-images.githubusercontent.com", "23.235.37.133");
-        put(hosts, "github.com", "20.207.73.82");
-        put(hosts, "pages.github.com", "20.207.73.82");
-        put(hosts, "gist.github.com", "20.207.73.82");
-        put(hosts, "githubapp.com", "140.82.112.29");
-        put(hosts, "hub.docker.com", "54.208.73.48");
-        put(hosts, "github.io", "185.199.110.153");
-        put(hosts, "www.github.io", "185.199.110.153");
-        HOSTS = Collections.unmodifiableMap(hosts);
-    }
-
-    static byte[] handle(byte[] packet, int length, AcceleratorVpnService.DnsForwarder forwarder) {
+    static byte[] handle(byte[] packet, int length, Map<String, List<byte[]>> rules,
+                         AcceleratorVpnService.DnsForwarder forwarder) {
         try {
             if (length < 28 || (packet[0] >>> 4) != 4) return null;
             int ipHeader = (packet[0] & 0x0f) * 4;
@@ -48,9 +22,17 @@ final class DnsPacketHandler {
             byte[] query = slice(packet, dnsOffset, dnsLength);
             Question question = parseQuestion(query);
             byte[] dnsResponse;
-            byte[] address = HOSTS.get(question.name);
-            if (address != null && question.type == 1) dnsResponse = answerA(query, question.endOffset, address);
-            else if (address != null && question.type == 28) dnsResponse = answerEmpty(query, question.endOffset);
+            List<byte[]> configured = rules.get(question.name);
+            if (configured != null && question.type == 1) {
+                List<byte[]> candidates = new ArrayList<>(configured);
+                try {
+                    for (byte[] address : extractA(forwarder.forward(query))) {
+                        if (!contains(candidates, address) && candidates.size() < 8) candidates.add(address);
+                    }
+                } catch (Exception ignored) { }
+                dnsResponse = answerA(query, question.endOffset, candidates);
+            }
+            else if (configured != null && question.type == 28) dnsResponse = answerEmpty(query, question.endOffset);
             else dnsResponse = forwarder.forward(query);
             return wrapUdpIpv4(packet, ipHeader, sourcePort, dnsResponse);
         } catch (Exception ignored) {
@@ -74,16 +56,55 @@ final class DnsPacketHandler {
         return new Question(name.toString().toLowerCase(), type, offset + 4);
     }
 
-    private static byte[] answerA(byte[] query, int questionEnd, byte[] address) throws Exception {
-        ByteArrayOutputStream out = new ByteArrayOutputStream(questionEnd + 16);
+    private static byte[] answerA(byte[] query, int questionEnd, List<byte[]> addresses) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(questionEnd + addresses.size() * 16);
         out.write(query, 0, questionEnd);
         byte[] data = out.toByteArray();
         data[2] = (byte) 0x81; data[3] = (byte) 0x80;
-        data[6] = 0; data[7] = 1;
+        data[6] = (byte) (addresses.size() >>> 8); data[7] = (byte) addresses.size();
         out.reset(); out.write(data);
-        out.write(new byte[] {(byte) 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4});
-        out.write(address);
+        for (byte[] address : addresses) {
+            out.write(new byte[] {(byte) 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4});
+            out.write(address);
+        }
         return out.toByteArray();
+    }
+
+    private static List<byte[]> extractA(byte[] dns) {
+        List<byte[]> result = new ArrayList<>();
+        if (dns == null || dns.length < 12) return result;
+        int offset = 12;
+        int questions = u16(dns, 4), answers = u16(dns, 6);
+        try {
+            for (int i = 0; i < questions; i++) { offset = skipName(dns, offset); offset += 4; }
+            for (int i = 0; i < answers && offset < dns.length; i++) {
+                offset = skipName(dns, offset);
+                if (offset + 10 > dns.length) break;
+                int type = u16(dns, offset), klass = u16(dns, offset + 2), size = u16(dns, offset + 8);
+                offset += 10;
+                if (offset + size > dns.length) break;
+                if (type == 1 && klass == 1 && size == 4) {
+                    byte[] address = slice(dns, offset, 4);
+                    if (!contains(result, address)) result.add(address);
+                }
+                offset += size;
+            }
+        } catch (Exception ignored) { }
+        return result;
+    }
+
+    private static int skipName(byte[] dns, int offset) {
+        while (offset < dns.length) {
+            int size = dns[offset++] & 0xff;
+            if (size == 0) return offset;
+            if ((size & 0xc0) == 0xc0) {
+                if (offset >= dns.length) throw new IllegalArgumentException("Truncated DNS pointer");
+                return offset + 1;
+            }
+            if (size > 63 || offset + size > dns.length) throw new IllegalArgumentException("Invalid DNS name");
+            offset += size;
+        }
+        throw new IllegalArgumentException("Truncated DNS name");
     }
 
     private static byte[] answerEmpty(byte[] query, int questionEnd) {
@@ -120,9 +141,9 @@ final class DnsPacketHandler {
         return (int) (~sum) & 0xffff;
     }
 
-    private static void put(Map<String, byte[]> map, String host, String ip) {
-        try { map.put(host, InetAddress.getByName(ip).getAddress()); }
-        catch (Exception error) { throw new IllegalArgumentException(error); }
+    private static boolean contains(List<byte[]> values, byte[] candidate) {
+        for (byte[] value : values) if (Arrays.equals(value, candidate)) return true;
+        return false;
     }
 
     private static int u16(byte[] data, int offset) { return ((data[offset] & 0xff) << 8) | (data[offset + 1] & 0xff); }

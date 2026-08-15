@@ -18,6 +18,7 @@ import android.widget.TextView;
 public final class MainActivity extends Activity {
     private static final int VPN_REQUEST = 1001;
     private TextView status;
+    private TextView ruleStatus;
     private Button action;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
@@ -67,6 +68,7 @@ public final class MainActivity extends Activity {
         status.setText(running ? "加速中\nGitHub DNS 路由已启用" : "已停止\n网络设置保持原状");
         status.setTextColor(Color.parseColor(running ? "#15803D" : "#475569"));
         action.setText(running ? "停止并恢复网络" : "开启 GitHub 加速");
+        ruleStatus.setText("规则：" + AcceleratorVpnService.ruleStatus());
     }
 
     private View createContent() {
@@ -101,6 +103,14 @@ public final class MainActivity extends Activity {
         statusParams.topMargin = dp(64);
         root.addView(status, statusParams);
 
+        ruleStatus = new TextView(this);
+        ruleStatus.setTextSize(13);
+        ruleStatus.setTextColor(Color.parseColor("#64748B"));
+        ruleStatus.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams ruleParams = matchWrap();
+        ruleParams.topMargin = dp(16);
+        root.addView(ruleStatus, ruleParams);
+
         action = new Button(this);
         action.setTextSize(17);
         action.setAllCaps(false);
@@ -109,7 +119,7 @@ public final class MainActivity extends Activity {
         root.addView(action, buttonParams);
 
         TextView note = new TextView(this);
-        note.setText("仅接管 DNS，不上传流量，不修改系统 Hosts。\n系统会显示一个本地 VPN 标志；同一时间不能与其他 VPN 共用。");
+        note.setText("优先使用加密 DNS，并自动更新与缓存规则。\n仅接管 DNS，不上传网页流量，不修改系统 Hosts。\n同一时间不能与其他 VPN 共用。");
         note.setTextSize(14);
         note.setTextColor(Color.parseColor("#64748B"));
         note.setGravity(Gravity.CENTER);

@@ -19,7 +19,14 @@ $references = Get-ChildItem -LiteralPath $runtime.FullName -Filter '*.dll' |
     ForEach-Object { '/r:"' + $_.FullName + '"' }
 
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-& $compiler /nologo /noconfig /nostdlib+ /target:exe /optimize+ /codepage:65001 `
-    "/out:$binDir\NetAcceleratorServer.dll" $references `
-    "$PSScriptRoot\NetAcceleratorServer.cs"
-if ($LASTEXITCODE -ne 0) { throw "Compilation failed with exit code $LASTEXITCODE." }
+$target = Join-Path $binDir 'NetAcceleratorServer.dll'
+$temporary = Join-Path ([IO.Path]::GetTempPath()) ("NetAcceleratorServer-{0}.dll" -f [guid]::NewGuid().ToString('N'))
+try {
+    & $compiler /nologo /noconfig /nostdlib+ /target:exe /optimize+ /codepage:65001 `
+        "/out:$temporary" $references `
+        "$PSScriptRoot\NetAcceleratorServer.cs"
+    if ($LASTEXITCODE -ne 0) { throw "Compilation failed with exit code $LASTEXITCODE." }
+    [IO.File]::Copy($temporary, $target, $true)
+} finally {
+    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+}

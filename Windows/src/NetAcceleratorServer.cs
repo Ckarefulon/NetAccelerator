@@ -40,9 +40,12 @@ namespace NetAccelerator
         private static readonly object LogLock = new object();
         private static readonly object DnsLock = new object();
         private static readonly object BackoffLock = new object();
+        private static readonly object AddressStateLock = new object();
         private static readonly object HttpClientLock = new object();
         private static readonly Dictionary<string, DnsCacheEntry> DnsCache = new Dictionary<string, DnsCacheEntry>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, DateTime> UpstreamBackoff = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, DateTime> AddressBackoff = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, IPAddress> PreferredAddresses = new Dictionary<string, IPAddress>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, ManagedClientEntry> HttpClients = new Dictionary<string, ManagedClientEntry>(StringComparer.OrdinalIgnoreCase);
         private static volatile bool stopping;
         private static TcpListener httpListener;
@@ -260,7 +263,7 @@ namespace NetAccelerator
                     addresses.AddRange(ResolveTrusted(forward));
             }
             addresses.AddRange(ResolveTrusted(target.OriginalHost));
-            addresses = addresses.GroupBy(x => x.ToString()).Select(x => x.First()).ToList();
+            addresses = OrderCandidateAddresses(target.OriginalHost, addresses).ToList();
             var failures = new List<Exception>();
             foreach (IPAddress address in addresses)
             {
@@ -271,10 +274,11 @@ namespace NetAccelerator
                     socket.NoDelay = true;
                     using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                     {
-                        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                        timeout.CancelAfter(TimeSpan.FromMilliseconds(2500));
                         await socket.ConnectAsync(new IPEndPoint(address, context.DnsEndPoint.Port), timeout.Token).AsTask();
                         var network = new NetworkStream(socket, true);
                         socket = null;
+                        RememberAddress(target.OriginalHost, address);
                         Log("CONNECT-CALLBACK " + target.OriginalHost + " -> " + address);
                         return network;
                     }
@@ -282,6 +286,7 @@ namespace NetAccelerator
                 catch (Exception ex)
                 {
                     failures.Add(ex);
+                    MarkAddressFailed(address);
                     if (socket != null) try { socket.Dispose(); } catch { }
                 }
             }
@@ -683,6 +688,7 @@ namespace NetAccelerator
             IPAddress[] addresses = IPAddress.TryParse(host, out literal)
                 ? new[] { literal }
                 : ResolveTrusted(host);
+            addresses = OrderCandidateAddresses(host, addresses).ToArray();
             for (int attempt = 0; attempt < 1; attempt++)
             {
                 foreach (IPAddress address in addresses)
@@ -697,10 +703,12 @@ namespace NetAccelerator
                         {
                             tcp.EndConnect(ar);
                             selected = address;
+                            RememberAddress(host, address);
                             return tcp;
                         }
                     }
-                    catch { }
+                    catch { MarkAddressFailed(address); }
+                    if (tcp != null && !tcp.Connected) MarkAddressFailed(address);
                     if (tcp != null) try { tcp.Close(); } catch { }
                 }
             }
@@ -716,20 +724,63 @@ namespace NetAccelerator
                     return cached.Addresses;
             }
 
-            var result = new List<IPAddress>();
-            foreach (string dns in DnsServers)
+            Task<IPAddress[]>[] queries = DnsServers.Select(dns => Task.Run(delegate
             {
                 try
                 {
-                    result.AddRange(QueryDnsA(host, IPAddress.Parse(dns)));
-                    if (result.Count > 0) break;
+                    return QueryDnsA(host, IPAddress.Parse(dns)).ToArray();
                 }
-                catch { }
+                catch { return new IPAddress[0]; }
+            })).ToArray();
+            try { Task.WaitAll(queries.Cast<Task>().ToArray(), 3000); } catch { }
+
+            var result = new List<IPAddress>();
+            foreach (Task<IPAddress[]> query in queries)
+            {
+                if (query.Status == TaskStatus.RanToCompletion) result.AddRange(query.Result);
             }
-            IPAddress[] unique = result.Where(ip => !IPAddress.IsLoopback(ip)).Distinct().ToArray();
+            IPAddress[] unique = OrderCandidateAddresses(host, result).ToArray();
             lock (DnsLock)
-                DnsCache[host] = new DnsCacheEntry { ExpiresUtc = DateTime.UtcNow.AddMinutes(5), Addresses = unique };
+                DnsCache[host] = new DnsCacheEntry
+                {
+                    ExpiresUtc = DateTime.UtcNow.Add(unique.Length > 0 ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(20)),
+                    Addresses = unique
+                };
+            Log("DNS-DISCOVERY host=" + host + " candidates=" + String.Join(",", unique.Select(x => x.ToString())));
             return unique;
+        }
+
+        private static IEnumerable<IPAddress> OrderCandidateAddresses(string host, IEnumerable<IPAddress> source)
+        {
+            List<IPAddress> unique = source.Where(ip => ip != null && !IPAddress.IsLoopback(ip))
+                .GroupBy(ip => ip.ToString()).Select(group => group.First()).ToList();
+            lock (AddressStateLock)
+            {
+                DateTime now = DateTime.UtcNow;
+                foreach (string expired in AddressBackoff.Where(pair => pair.Value <= now).Select(pair => pair.Key).ToArray())
+                    AddressBackoff.Remove(expired);
+                List<IPAddress> available = unique.Where(ip => !AddressBackoff.ContainsKey(ip.ToString())).ToList();
+                List<IPAddress> delayed = unique.Where(ip => AddressBackoff.ContainsKey(ip.ToString())).ToList();
+                IPAddress preferred;
+                if (PreferredAddresses.TryGetValue(host, out preferred))
+                    available = available.OrderByDescending(ip => ip.Equals(preferred)).ToList();
+                return available.Concat(delayed).ToArray();
+            }
+        }
+
+        private static void RememberAddress(string host, IPAddress address)
+        {
+            lock (AddressStateLock)
+            {
+                PreferredAddresses[host] = address;
+                AddressBackoff.Remove(address.ToString());
+            }
+        }
+
+        private static void MarkAddressFailed(IPAddress address)
+        {
+            if (address == null) return;
+            lock (AddressStateLock) AddressBackoff[address.ToString()] = DateTime.UtcNow.AddMinutes(2);
         }
 
         private static IEnumerable<IPAddress> QueryDnsA(string host, IPAddress dnsServer)
@@ -752,6 +803,7 @@ namespace NetAccelerator
                 udp.Send(packet, packet.Length, new IPEndPoint(dnsServer, 53));
                 IPEndPoint remote = null;
                 byte[] response = udp.Receive(ref remote);
+                if (remote == null || !remote.Address.Equals(dnsServer)) return new IPAddress[0];
                 return ParseDnsA(response, id);
             }
         }

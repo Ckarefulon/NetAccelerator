@@ -5,15 +5,18 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Intent;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.VpnService;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class AcceleratorVpnService extends VpnService {
@@ -23,11 +26,16 @@ public final class AcceleratorVpnService extends VpnService {
     private static final String CHANNEL_ID = "accelerator";
     private static final int NOTIFICATION_ID = 7;
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
+    private static volatile String RULE_STATUS = "尚未加载规则";
 
     private ParcelFileDescriptor tunnel;
     private Thread worker;
+    private ScheduledExecutorService updater;
+    private volatile RuleRepository.Snapshot ruleSnapshot;
+    private DnsResolverChain resolverChain;
 
     public static boolean isRunning() { return RUNNING.get(); }
+    public static String ruleStatus() { return RULE_STATUS; }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
@@ -44,18 +52,29 @@ public final class AcceleratorVpnService extends VpnService {
 
     private synchronized void startVpn() {
         try {
-            tunnel = new Builder()
+            ruleSnapshot = RuleRepository.load(this);
+            RULE_STATUS = ruleSnapshot.description + " · " + ruleSnapshot.rules.size() + " 个域名";
+            resolverChain = new DnsResolverChain(this);
+            Network underlying = findUnderlyingNetwork();
+            Builder builder = new Builder()
                     .setSession("NetAccelerator")
                     .setMtu(1500)
                     .addAddress("10.77.0.2", 32)
                     .addDnsServer("10.77.0.1")
                     .addRoute("10.77.0.1", 32)
-                    .setBlocking(true)
-                    .establish();
+                    .setBlocking(true);
+            if (underlying != null) builder.setUnderlyingNetworks(new Network[] { underlying });
+            tunnel = builder.establish();
             if (tunnel == null) throw new IllegalStateException("VPN permission is unavailable");
             RUNNING.set(true);
             worker = new Thread(this::runDnsLoop, "NetAccelerator-DNS");
             worker.start();
+            updater = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread thread = new Thread(r, "NetAccelerator-Rules");
+                thread.setDaemon(true);
+                return thread;
+            });
+            updater.scheduleWithFixedDelay(this::refreshRules, 0, 6, TimeUnit.HOURS);
             sendBroadcast(new Intent(ACTION_STATE).setPackage(getPackageName()));
         } catch (Exception error) {
             Log.e("NetAccelerator", "Could not start VPN", error);
@@ -70,7 +89,8 @@ public final class AcceleratorVpnService extends VpnService {
             while (RUNNING.get()) {
                 int length = input.read(packet);
                 if (length <= 0) continue;
-                byte[] response = DnsPacketHandler.handle(packet, length, this::forwardDns);
+                RuleRepository.Snapshot current = ruleSnapshot;
+                byte[] response = DnsPacketHandler.handle(packet, length, current.rules, resolverChain::resolve);
                 if (response != null) output.write(response);
             }
         } catch (Exception error) {
@@ -80,25 +100,38 @@ public final class AcceleratorVpnService extends VpnService {
         }
     }
 
-    private byte[] forwardDns(byte[] query) throws Exception {
-        InetAddress resolver = InetAddress.getByName("1.1.1.1");
-        try (DatagramSocket socket = new DatagramSocket()) {
-            if (!protect(socket)) throw new IllegalStateException("Could not exclude DNS socket from VPN");
-            socket.setSoTimeout(3500);
-            socket.send(new DatagramPacket(query, query.length, resolver, 53));
-            byte[] buffer = new byte[4096];
-            DatagramPacket reply = new DatagramPacket(buffer, buffer.length);
-            socket.receive(reply);
-            byte[] result = new byte[reply.getLength()];
-            System.arraycopy(reply.getData(), reply.getOffset(), result, 0, result.length);
-            return result;
+    private void refreshRules() {
+        try {
+            RuleRepository.Snapshot updated = RuleRepository.refresh(this, findUnderlyingNetwork());
+            ruleSnapshot = updated;
+            RULE_STATUS = updated.description + " · " + updated.rules.size() + " 个域名";
+        } catch (Exception error) {
+            RuleRepository.Snapshot current = ruleSnapshot;
+            RULE_STATUS = (current == null ? "规则更新失败" : current.description + "（更新失败，继续使用）");
+            Log.w("NetAccelerator", "Rule refresh failed", error);
         }
+        sendBroadcast(new Intent(ACTION_STATE).setPackage(getPackageName()));
+    }
+
+    Network findUnderlyingNetwork() {
+        ConnectivityManager manager = getSystemService(ConnectivityManager.class);
+        Network fallback = null;
+        for (Network network : manager.getAllNetworks()) {
+            NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+            if (capabilities == null || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                    || !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue;
+            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return network;
+            if (fallback == null) fallback = network;
+        }
+        return fallback;
     }
 
     private synchronized void stopVpn() {
         if (!RUNNING.getAndSet(false) && tunnel == null) { stopSelf(); return; }
         try { if (tunnel != null) tunnel.close(); } catch (Exception ignored) { }
         tunnel = null;
+        if (updater != null) updater.shutdownNow();
+        updater = null;
         if (worker != null && worker != Thread.currentThread()) worker.interrupt();
         worker = null;
         sendBroadcast(new Intent(ACTION_STATE).setPackage(getPackageName()));
