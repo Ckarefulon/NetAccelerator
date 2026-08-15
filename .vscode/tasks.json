@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "构建安卓 APK",
+      "type": "shell",
+      "command": "bash .devcontainer/build-android.sh",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gradle"]
+    },
+    {
+      "label": "清理安卓构建",
+      "type": "shell",
+      "command": "gradle --project-dir android --no-daemon clean",
+      "problemMatcher": ["$gradle"]
+    }
+  ]
+}

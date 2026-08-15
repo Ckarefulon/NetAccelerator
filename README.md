@@ -1,5 +1,7 @@
 # NetAccelerator
 
+> 安卓无 Root 版本源码位于 [`android/`](android/README.md)。它使用仅本机的 `VpnService` DNS 通道，保留 Windows 版本不变；仓库已配置 GitHub Codespaces 云端构建，能力边界和构建方式见安卓说明。
+
 NetAccelerator 是只保留 **Github** 与 **国外验证码平台** 的轻量 Watt Toolkit Hosts 模式实现。它本身不是全局 `CONNECT` 代理，也不会修改、停止或重启 Clash。
 
 ## 与 Watt Toolkit 相同的核心链路

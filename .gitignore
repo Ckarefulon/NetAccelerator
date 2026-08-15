@@ -1,1 +1,5 @@
-runtime/
+Windows/runtime/
+Android/.gradle/
+Android/local.properties
+Android/**/build/
+artifacts/
